@@ -1,0 +1,47 @@
+name: Parse NHTK Schedule
+
+on:
+  schedule:
+    # Каждый день в 07:30 по Новосибирску (UTC+7)
+    # 07:30 NSK = 00:30 UTC
+    - cron: '30 0 * * *'
+  workflow_dispatch:  # Ручной запуск через вкладку Actions
+
+jobs:
+  parse-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5  # ⚡ Жесткое ограничение времени выполнения
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 📦 Install dependencies
+        # ⚡ Пропускаем установку, если это плановый запуск (экономим время)
+        # Зависимости кэшируются GitHub автоматически
+        if: github.event_name != 'schedule'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🔄 Run parser
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # Флаг, что это плановый запуск (для оптимизации в Python)
+          IS_SCHEDULED: 'true'
+        run: python parser.py
+
+      - name: 📤 Upload JSON artifact (ТОЛЬКО при ошибке)
+        # ⚡ Загружаем файл для отладки, только если шаг парсера упал
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-schedule-json
+          path: nhtk_schedule.json
+          retention-days: 5
