@@ -33,15 +33,16 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # Флаг, что это плановый запуск (для оптимизации в Python)
           IS_SCHEDULED: 'true'
-        run: python parser.py
+        run: python parser_supabase.py
 
       - name: 📤 Upload JSON artifact (ТОЛЬКО при ошибке)
-        # ⚡ Загружаем файл для отладки, только если шаг парсера упал
+        # ⚡ v4: Загружаем файл для отладки, только если шаг парсера упал
         if: failure()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # ✅ Обновлено до v4
         with:
           name: debug-schedule-json
           path: nhtk_schedule.json
           retention-days: 5
+          # В v4 параметр if-no-files-found добавлен для безопасности
+          if-no-files-found: ignore
