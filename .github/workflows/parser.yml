@@ -34,6 +34,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           IS_SCHEDULED: 'true'
+          FORCE_UPDATE: 'true'
         run: python parser_supabase.py
 
       - name: 📤 Upload JSON artifact (ТОЛЬКО при ошибке)
