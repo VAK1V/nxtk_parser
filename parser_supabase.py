@@ -39,6 +39,7 @@ class NHTKLiveParser:
     def fetch_page(self, url: str) -> Optional[str]:
         """Получение HTML страницы (быстрое)"""
         try:
+            # ⚡ Уменьшили таймаут для скорости
             response = self.session.get(url, timeout=10)
             response.encoding = 'utf-8'
             response.raise_for_status()
@@ -110,7 +111,7 @@ class NHTKLiveParser:
     def _parse_lesson_row(self, cells, day: str) -> Optional[Dict]:
         try:
             lesson = {
-                "day": day, "lesson_number": None, "time": "", "subject": "",
+                "day": day, "lesson_number": "", "time": "", "subject": "",
                 "subject_url": "", "teacher": "", "teacher_url": "",
                 "room": "", "room_url": "", "subgroup": ""
             }
@@ -122,23 +123,12 @@ class NHTKLiveParser:
                 if href and not href.startswith('http'):
                     href = self.base_url + '/' + href.lstrip('/')
 
-                # ✅ Улучшенный парсинг номера пары
-                if i < 2 and re.match(r'^\s*[1-9]\s*$', text):
-                    try:
-                        lesson["lesson_number"] = int(text.strip())
-                    except ValueError:
-                        pass
+                if i == 0 and re.match(r'^\d+$', text):
+                    lesson["lesson_number"] = text
                     continue
-
-                # Время
                 if re.search(r'\d{1,2}:\d{2}–\d{1,2}:\d{2}', text):
                     lesson["time"] = text
-                    # Если номер пары не найден, определяем по времени
-                    if lesson["lesson_number"] is None:
-                        lesson["lesson_number"] = self._get_lesson_from_time(text)
                     continue
-
-                # Предмет
                 if link and 'do.nhtk-edu.ru' in href:
                     subject_clean = re.sub(r'\s+', ' ', text).strip()
                     subject_clean = re.sub(r'\s*к/п\s*', ' ', subject_clean).strip()
@@ -148,21 +138,15 @@ class NHTKLiveParser:
                     if subgroup_match:
                         lesson["subgroup"] = subgroup_match.group(1).strip()
                     continue
-
-                # Преподаватель
                 if link and 'расписание.нхтк.рф' in href and not lesson["teacher"]:
                     lesson["teacher"] = text
                     lesson["teacher_url"] = href
                     continue
-
-                # Аудитория
                 if re.match(r'^(\d{2,3}|с/[зк])$', text, re.IGNORECASE):
                     lesson["room"] = text
-                    if link:
-                        lesson["room_url"] = href
+                    if link: lesson["room_url"] = href
                     continue
 
-            # Если предмет не найден через ссылку, пробуем найти по тексту
             if not lesson["subject"]:
                 for cell in cells:
                     text = cell.get_text(strip=True)
@@ -180,25 +164,6 @@ class NHTKLiveParser:
             print(f"⚠️ Ошибка парсинга строки: {e}")
             return None
 
-    def _get_lesson_from_time(self, time: str) -> Optional[int]:
-        """Определяет номер пары по времени начала"""
-        if not time:
-            return None
-
-        start_time = time.split('–')[0].strip() if '–' in time else time.split('-')[0].strip()
-
-        time_map = {
-            '8:30': 1, '08:30': 1,
-            '9:00': 1, '09:00': 1,
-            '10:15': 2, '10:30': 2,
-            '12:00': 3, '12:30': 3,
-            '14:00': 4, '14:30': 4,
-            '16:00': 5, '16:30': 5,
-            '18:00': 6, '18:30': 6,
-        }
-
-        return time_map.get(start_time)
-
     def save_to_json(self, data: Dict, filename: str = "nhtk_schedule.json") -> bool:
         try:
             with open(filename, 'w', encoding='utf-8') as f:
@@ -210,13 +175,17 @@ class NHTKLiveParser:
 
     def _get_data_hash(self, schedule: List[Dict]) -> str:
         """Создает хэш данных для проверки изменений"""
+        # Сортируем, чтобы порядок не влиял на хэш
         sorted_data = json.dumps(schedule, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(sorted_data.encode('utf-8')).hexdigest()
 
     def check_data_changed(self, new_data: Dict) -> bool:
-        """Проверяет, изменились ли данные по сравнению с тем, что в базе"""
+        """
+        Проверяет, изменились ли данные по сравнению с тем, что в базе.
+        Возвращает True, если есть изменения.
+        """
         if not SUPABASE_AVAILABLE:
-            return True
+            return True  # Если нет библиотеки, считаем что изменилось
 
         try:
             url = os.getenv("SUPABASE_URL")
@@ -230,6 +199,7 @@ class NHTKLiveParser:
             if not group_code:
                 return True
 
+            # Берем последнюю запись для этой группы
             response = supabase.table("schedule_items") \
                 .select("data_hash") \
                 .eq("group_code", group_code) \
@@ -253,7 +223,7 @@ class NHTKLiveParser:
 
         except Exception as e:
             print(f"⚠️ Ошибка проверки изменений: {e}")
-            return True
+            return True  # При ошибке лучше обновить
 
     def save_to_supabase(self, data: Dict) -> bool:
         if not SUPABASE_AVAILABLE:
@@ -272,16 +242,24 @@ class NHTKLiveParser:
             if not schedule_items:
                 return False
 
+            # Вычисляем хэш для всей пачки
             current_data_hash = self._get_data_hash(schedule_items)
 
             items_to_insert = []
             for item in schedule_items:
+                lesson_num = None
+                if item.get("lesson_number"):
+                    try:
+                        lesson_num = int(item["lesson_number"])
+                    except (ValueError, TypeError):
+                        lesson_num = None
+
                 items_to_insert.append({
                     "group_code": metadata.get("group", ""),
                     "period": metadata.get("period", ""),
                     "source_url": metadata.get("source_url", ""),
                     "day": item.get("day", ""),
-                    "lesson_number": item.get("lesson_number"),  # Уже int или None
+                    "lesson_number": lesson_num,
                     "time": item.get("time", ""),
                     "subject": item.get("subject", ""),
                     "subject_url": item.get("subject_url", ""),
@@ -291,14 +269,9 @@ class NHTKLiveParser:
                     "room_url": item.get("room_url", ""),
                     "subgroup": item.get("subgroup", ""),
                     "parsed_at": datetime.now().isoformat(),
-                    "data_hash": current_data_hash
+                    "data_hash": current_data_hash  # Сохраняем хэш
                 })
 
-            # ✅ СНАЧАЛА удаляем старые записи этой группы
-            print(f"🗑️ Удаляем старые записи для группы: {metadata.get('group', '')}")
-            supabase.table("schedule_items").delete().eq("group_code", metadata.get("group")).execute()
-
-            # ✅ ПОТОМ вставляем новые
             response = supabase.table("schedule_items").insert(items_to_insert).execute()
             print(f"✅ Загружено {len(items_to_insert)} записей в Supabase")
             return True
@@ -322,32 +295,31 @@ class NHTKLiveParser:
 
         print(f"📊 Найдено занятий: {len(data['schedule'])}")
 
+        # Сохраняем локальный JSON всегда (для артефакта при ошибке)
         self.save_to_json(data, output_file)
 
+        # Логика отправки в облако
         if upload_to_supabase:
-            # ✅ Проверка флага принудительного обновления
-            force_update = os.getenv("FORCE_UPDATE") == 'true'
-
-            if force_update:
-                print("⚡ FORCE_UPDATE: принудительная перезапись данных")
-                has_changes = True
-            else:
-                has_changes = self.check_data_changed(data)
+            # 1. Проверяем, изменились ли данные
+            has_changes = self.check_data_changed(data)
 
             if not has_changes:
-                print("💤 Данные не изменились, загрузка в базу пропущена")
+                print("💤 Данные не изменились, загрузка в базу пропущена (экономия ресурсов)")
+                # Возвращаем True, так как ошибка не произошла, просто нет новых данных
                 return True
 
+            # 2. Если изменения есть — загружаем
             print("☁️ Отправка обновленных данных в Supabase...")
             return self.save_to_supabase(data)
 
         return True
 
     def get_schedule_summary(self, data: Dict) -> Dict:
-        return {
+        summary = {
             "group": data["metadata"]["group"],
             "total_lessons": len(data["schedule"]),
         }
+        return summary
 
 
 if __name__ == "__main__":
@@ -358,7 +330,9 @@ if __name__ == "__main__":
     parser = NHTKLiveParser()
     url = "https://расписание.нхтк.рф/09.07.13п1.html"
 
+    # Проверка наличия ключей
     has_keys = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"))
+    # Проверка флага планового запуска
     is_scheduled = os.getenv("IS_SCHEDULED") == 'true'
 
     print(f"🔑 Ключи Supabase: {'Найдены' if has_keys else 'Не найдены'}")
@@ -375,6 +349,6 @@ if __name__ == "__main__":
         print("\n✅ Задача выполнена успешно")
     else:
         print("\n❌ Ошибка выполнения")
-        exit(1)
+        exit(1)  # Важно для GitHub Actions: код 1 означает ошибку
 
     print("=" * 60)
