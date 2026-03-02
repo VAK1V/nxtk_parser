@@ -31,9 +31,9 @@ jobs:
 
       - name: 🔄 Run parser
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          IS_SCHEDULED: 'true'
+          YDB_ENDPOINT: "grpcs://ydb.serverless.yandexcloud.net:2135"
+          YDB_DATABASE: "/ru-central1/b1g.../etn..."  # путь к вашей БД
+          YDB_TOKEN: ${{ secrets.YDB_IAM_TOKEN }}
         run: python parser_supabase.py
 
       - name: 📤 Upload JSON artifact (ТОЛЬКО при ошибке)

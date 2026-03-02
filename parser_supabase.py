@@ -1,28 +1,164 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Парсер расписания НХТК с оптимизацией для GitHub Actions
-Проверяет изменения перед отправкой в Supabase
+Парсер расписания НХТК с интеграцией Yandex Database (YDB)
+Проверяет изменения перед отправкой в YDB
 """
 
 import requests
 from bs4 import BeautifulSoup
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 import time
 import os
 import hashlib
 
-# === Импорт для Supabase ===
+# === Импорт для YDB ===
 try:
-    from supabase import create_client, Client
+    import ydb
+    from ydb.query_pool import QuerySessionPool
 
-    SUPABASE_AVAILABLE = True
+    YDB_AVAILABLE = True
 except ImportError:
-    SUPABASE_AVAILABLE = False
-    print("⚠️ Библиотека supabase не установлена.")
+    YDB_AVAILABLE = False
+    print("⚠️ Библиотека ydb не установлена. Установите: pip install ydb")
+
+
+class YDBClient:
+    """Клиент для работы с Yandex Database"""
+
+    def __init__(self):
+        self.endpoint = os.getenv("YDB_ENDPOINT", "grpcs://ydb.serverless.yandexcloud.net:2135")
+        self.database = os.getenv("YDB_DATABASE", "")
+        self.token = os.getenv("YDB_TOKEN")
+        self.driver = None
+        self.pool = None
+
+    def connect(self) -> bool:
+        """Инициализация драйвера и пула сессий"""
+        if not YDB_AVAILABLE:
+            return False
+
+        if not self.database:
+            print("❌ Не указан YDB_DATABASE в переменных окружения")
+            return False
+
+        try:
+            # Настройка драйвера
+            driver_config = ydb.DriverConfig(
+                endpoint=self.endpoint,
+                database=self.database,
+                credentials=(
+                    ydb.AccessTokenCredentials(self.token) if self.token
+                    else ydb.credentials_from_env_variables()
+                ),
+                root_certificates=ydb.load_ydb_root_certificate(),
+            )
+            self.driver = ydb.Driver(driver_config)
+            self.driver.wait(timeout=10)
+
+            # Пул сессий для выполнения запросов
+            self.pool = QuerySessionPool(self.driver)
+            print("✅ Подключение к YDB успешно")
+            return True
+        except Exception as e:
+            print(f"❌ Ошибка подключения к YDB: {e}")
+            return False
+
+    def close(self):
+        """Закрытие подключения"""
+        if self.pool:
+            try:
+                self.pool.stop()
+            except:
+                pass
+        if self.driver:
+            try:
+                self.driver.stop()
+            except:
+                pass
+
+    def get_last_hash(self, group_code: str) -> Optional[str]:
+        """Получение последнего хэша для группы"""
+        if not self.pool:
+            return None
+
+        query = """
+        DECLARE $group_code AS Utf8;
+        SELECT data_hash FROM `schedule_items`
+        WHERE group_code = $group_code
+        ORDER BY parsed_at DESC
+        LIMIT 1;
+        """
+
+        try:
+            def query_callback(session: ydb.Session):
+                return session.execute_scheme(query, {"$group_code": group_code})
+
+            result = self.pool.retry_operation_sync(query_callback)
+            if result and result.result_sets and result.result_sets[0].rows:
+                return result.result_sets[0].rows[0].data_hash
+            return None
+        except Exception as e:
+            print(f"⚠️ Ошибка получения хэша из YDB: {e}")
+            return None
+
+    def upsert_schedule_items(self, items: List[Dict]) -> bool:
+        """Массовая вставка/обновление записей через UPSERT"""
+        if not self.pool or not items:
+            return False
+
+        # Формируем VALUES для UPSERT с экранированием строк
+        values = []
+        for item in items:
+            # Генерируем уникальный ID
+            item_id = f"{item['group_code']}_{item['day']}_{item['lesson_number'] or 0}_{item['data_hash'][:8]}"
+
+            # Экранируем строковые значения для SQL
+            def escape_sql(s):
+                if s is None:
+                    return "NULL"
+                return "'" + str(s).replace("'", "''") + "'"
+
+            values.append(f"""(
+                {escape_sql(item_id)},
+                {escape_sql(item['group_code'])},
+                {escape_sql(item.get('period', ''))},
+                {escape_sql(item.get('source_url', ''))},
+                {escape_sql(item['day'])},
+                {item['lesson_number'] if item['lesson_number'] is not None else 'NULL'},
+                {escape_sql(item.get('time', ''))},
+                {escape_sql(item.get('subject', ''))},
+                {escape_sql(item.get('subject_url', ''))},
+                {escape_sql(item.get('teacher', ''))},
+                {escape_sql(item.get('teacher_url', ''))},
+                {escape_sql(item.get('room', ''))},
+                {escape_sql(item.get('room_url', ''))},
+                {escape_sql(item.get('subgroup', ''))},
+                CurrentUtcTimestamp(),
+                {escape_sql(item['data_hash'])}
+            )""")
+
+        query = f"""
+        UPSERT INTO `schedule_items` (
+            id, group_code, period, source_url, day, lesson_number, time,
+            subject, subject_url, teacher, teacher_url, room, room_url,
+            subgroup, parsed_at, data_hash
+        ) VALUES {','.join(values)};
+        """
+
+        try:
+            def query_callback(session: ydb.Session):
+                return session.execute_scheme(query)
+
+            self.pool.retry_operation_sync(query_callback)
+            print(f"✅ Загружено {len(items)} записей в YDB")
+            return True
+        except Exception as e:
+            print(f"❌ Ошибка UPSERT в YDB: {e}")
+            return False
 
 
 class NHTKLiveParser:
@@ -35,11 +171,11 @@ class NHTKLiveParser:
             'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
             'Connection': 'keep-alive'
         })
+        self.ydb_client = YDBClient()
 
     def fetch_page(self, url: str) -> Optional[str]:
-        """Получение HTML страницы (быстрое)"""
+        """Получение HTML страницы"""
         try:
-            # ⚡ Уменьшили таймаут для скорости
             response = self.session.get(url, timeout=10)
             response.encoding = 'utf-8'
             response.raise_for_status()
@@ -86,7 +222,8 @@ class NHTKLiveParser:
 
         for row in soup.find_all('tr'):
             cells = row.find_all(['td', 'th'])
-            if not cells: continue
+            if not cells:
+                continue
 
             cell_texts = [cell.get_text(strip=True) for cell in cells]
             full_text = ' '.join(cell_texts)
@@ -144,7 +281,8 @@ class NHTKLiveParser:
                     continue
                 if re.match(r'^(\d{2,3}|с/[зк])$', text, re.IGNORECASE):
                     lesson["room"] = text
-                    if link: lesson["room_url"] = href
+                    if link:
+                        lesson["room_url"] = href
                     continue
 
             if not lesson["subject"]:
@@ -175,43 +313,25 @@ class NHTKLiveParser:
 
     def _get_data_hash(self, schedule: List[Dict]) -> str:
         """Создает хэш данных для проверки изменений"""
-        # Сортируем, чтобы порядок не влиял на хэш
         sorted_data = json.dumps(schedule, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(sorted_data.encode('utf-8')).hexdigest()
 
     def check_data_changed(self, new_data: Dict) -> bool:
-        """
-        Проверяет, изменились ли данные по сравнению с тем, что в базе.
-        Возвращает True, если есть изменения.
-        """
-        if not SUPABASE_AVAILABLE:
-            return True  # Если нет библиотеки, считаем что изменилось
+        """Проверяет, изменились ли данные по сравнению с тем, что в YDB"""
+        if not YDB_AVAILABLE:
+            return True
 
         try:
-            url = os.getenv("SUPABASE_URL")
-            key = os.getenv("SUPABASE_KEY")
-            if not url or not key:
-                return True
-
-            supabase: Client = create_client(url, key)
             group_code = new_data.get("metadata", {}).get("group", "")
-
             if not group_code:
                 return True
 
-            # Берем последнюю запись для этой группы
-            response = supabase.table("schedule_items") \
-                .select("data_hash") \
-                .eq("group_code", group_code) \
-                .order("parsed_at", desc=True) \
-                .limit(1) \
-                .execute()
+            # Подключаемся к YDB, если ещё не подключены
+            if not self.ydb_client.pool:
+                if not self.ydb_client.connect():
+                    return True
 
-            if not response.data:
-                print("ℹ️ В базе нет предыдущих данных")
-                return True
-
-            old_hash = response.data[0].get("data_hash")
+            old_hash = self.ydb_client.get_last_hash(group_code)
             new_hash = self._get_data_hash(new_data.get("schedule", []))
 
             if old_hash == new_hash:
@@ -223,26 +343,24 @@ class NHTKLiveParser:
 
         except Exception as e:
             print(f"⚠️ Ошибка проверки изменений: {e}")
-            return True  # При ошибке лучше обновить
+            return True
 
-    def save_to_supabase(self, data: Dict) -> bool:
-        if not SUPABASE_AVAILABLE:
+    def save_to_ydb(self, data: Dict) -> bool:
+        """Сохранение данных в YDB"""
+        if not YDB_AVAILABLE:
             return False
 
         try:
-            url = os.getenv("SUPABASE_URL")
-            key = os.getenv("SUPABASE_KEY")
-            if not url or not key:
-                return False
+            if not self.ydb_client.pool:
+                if not self.ydb_client.connect():
+                    return False
 
-            supabase: Client = create_client(url, key)
             schedule_items = data.get("schedule", [])
             metadata = data.get("metadata", {})
 
             if not schedule_items:
                 return False
 
-            # Вычисляем хэш для всей пачки
             current_data_hash = self._get_data_hash(schedule_items)
 
             items_to_insert = []
@@ -268,20 +386,18 @@ class NHTKLiveParser:
                     "room": item.get("room", ""),
                     "room_url": item.get("room_url", ""),
                     "subgroup": item.get("subgroup", ""),
-                    "parsed_at": datetime.now().isoformat(),
-                    "data_hash": current_data_hash  # Сохраняем хэш
+                    "parsed_at": datetime.now(timezone.utc),
+                    "data_hash": current_data_hash
                 })
 
-            response = supabase.table("schedule_items").insert(items_to_insert).execute()
-            print(f"✅ Загружено {len(items_to_insert)} записей в Supabase")
-            return True
+            return self.ydb_client.upsert_schedule_items(items_to_insert)
 
         except Exception as e:
-            print(f"❌ Ошибка отправки в Supabase: {e}")
+            print(f"❌ Ошибка отправки в YDB: {e}")
             return False
 
     def parse_url(self, url: str, output_file: str = "nhtk_schedule.json",
-                  upload_to_supabase: bool = True, is_scheduled: bool = False) -> bool:
+                  upload_to_db: bool = True, is_scheduled: bool = False) -> bool:
         """Основной метод запуска"""
         if '#заголовок' not in url:
             url = url + '#заголовок'
@@ -295,22 +411,19 @@ class NHTKLiveParser:
 
         print(f"📊 Найдено занятий: {len(data['schedule'])}")
 
-        # Сохраняем локальный JSON всегда (для артефакта при ошибке)
+        # Сохраняем локальный JSON всегда
         self.save_to_json(data, output_file)
 
-        # Логика отправки в облако
-        if upload_to_supabase:
-            # 1. Проверяем, изменились ли данные
+        # Логика отправки в YDB
+        if upload_to_db:
             has_changes = self.check_data_changed(data)
 
             if not has_changes:
-                print("💤 Данные не изменились, загрузка в базу пропущена (экономия ресурсов)")
-                # Возвращаем True, так как ошибка не произошла, просто нет новых данных
+                print("💤 Данные не изменились, загрузка в базу пропущена")
                 return True
 
-            # 2. Если изменения есть — загружаем
-            print("☁️ Отправка обновленных данных в Supabase...")
-            return self.save_to_supabase(data)
+            print("☁️ Отправка обновленных данных в YDB...")
+            return self.save_to_ydb(data)
 
         return True
 
@@ -321,34 +434,45 @@ class NHTKLiveParser:
         }
         return summary
 
+    def cleanup(self):
+        """Закрытие соединений"""
+        self.ydb_client.close()
+
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("🎓 Парсер НХТК (Optimized for GitHub Actions)")
+    print("🎓 Парсер НХТК (YDB Edition)")
     print("=" * 60)
 
     parser = NHTKLiveParser()
     url = "https://расписание.нхтк.рф/09.07.13п1.html"
 
-    # Проверка наличия ключей
-    has_keys = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"))
-    # Проверка флага планового запуска
+    # Проверка наличия ключей YDB
+    has_keys = bool(
+        os.getenv("YDB_ENDPOINT") and
+        os.getenv("YDB_DATABASE") and
+        os.getenv("YDB_TOKEN")
+    )
     is_scheduled = os.getenv("IS_SCHEDULED") == 'true'
 
-    print(f"🔑 Ключи Supabase: {'Найдены' if has_keys else 'Не найдены'}")
+    print(f"🔑 Ключи YDB: {'Найдены' if has_keys else 'Не найдены'}")
     print(f"🕒 Тип запуска: {'Плановый (Cron)' if is_scheduled else 'Ручной'}")
 
-    success = parser.parse_url(
-        url,
-        "nhtk_schedule.json",
-        upload_to_supabase=has_keys,
-        is_scheduled=is_scheduled
-    )
+    try:
+        success = parser.parse_url(
+            url,
+            "nhtk_schedule.json",
+            upload_to_db=has_keys,
+            is_scheduled=is_scheduled
+        )
 
-    if success:
-        print("\n✅ Задача выполнена успешно")
-    else:
-        print("\n❌ Ошибка выполнения")
-        exit(1)  # Важно для GitHub Actions: код 1 означает ошибку
+        if success:
+            print("\n✅ Задача выполнена успешно")
+        else:
+            print("\n❌ Ошибка выполнения")
+            exit(1)
+    finally:
+        # Гарантированное закрытие соединений
+        parser.cleanup()
 
     print("=" * 60)
