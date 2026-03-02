@@ -32,7 +32,7 @@ jobs:
       - name: 🔄 Run parser
         env:
           YDB_ENDPOINT: "grpcs://ydb.serverless.yandexcloud.net:2135"
-          YDB_DATABASE: "/ru-central1/b1g.../etn..."  # путь к вашей БД
+          YDB_DATABASE: "/ru-central1/b1grdoqbih1pv3s7g2nh/etngvqpgkg93jkrd50n5"  # путь к вашей БД
           YDB_TOKEN: ${{ secrets.YDB_IAM_TOKEN }}
         run: python parser_supabase.py
 
